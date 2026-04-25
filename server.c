@@ -1,0 +1,374 @@
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <netinet/in.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_WORD 128
+#define BUFFER_SIZE 512
+#define DEFAULT_ROUNDS 5
+#define DEFAULT_TIME_LIMIT 12
+
+static void die_with_error(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+static void trim_newline(char *s) {
+    size_t len = strlen(s);
+    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r')) {
+        s[len - 1] = '\0';
+        len--;
+    }
+}
+
+static void to_lower_copy(char *dest, const char *src, size_t size) {
+    size_t i;
+    for (i = 0; i + 1 < size && src[i] != '\0'; ++i) {
+        dest[i] = (char)tolower((unsigned char)src[i]);
+    }
+    dest[i] = '\0';
+}
+
+static int recv_line(int sock, char *buffer, size_t size) {
+    size_t total = 0;
+    while (total + 1 < size) {
+        char ch;
+        ssize_t n = recv(sock, &ch, 1, 0);
+        if (n <= 0) {
+            return (int)n;
+        }
+        if (ch == '\n') {
+            break;
+        }
+        buffer[total++] = ch;
+    }
+    buffer[total] = '\0';
+    return (int)total;
+}
+
+static int send_all(int sock, const char *msg) {
+    size_t len = strlen(msg);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(sock, msg + sent, len - sent, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+static int prompt_with_timeout(int sock, const char *prompt, char *out, size_t out_size, int timeout_sec) {
+    if (send_all(sock, prompt) < 0) {
+        return -1;
+    }
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+
+    struct timeval tv;
+    tv.tv_sec = timeout_sec;
+    tv.tv_usec = 0;
+
+    int ready = select(sock + 1, &readfds, NULL, NULL, &tv);
+    if (ready == 0) {
+        return 0; // timed out
+    }
+    if (ready < 0) {
+        return -1;
+    }
+
+    int n = recv_line(sock, out, out_size);
+    if (n <= 0) {
+        return -1;
+    }
+    trim_newline(out);
+    return 1;
+}
+
+static void shuffle_chars(char *s) {
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; ++i) {
+        size_t j = (size_t)(rand() % (int)len);
+        char temp = s[i];
+        s[i] = s[j];
+        s[j] = temp;
+    }
+}
+
+static void distort_scramble(const char *word, char *out, size_t out_size) {
+    strncpy(out, word, out_size - 1);
+    out[out_size - 1] = '\0';
+    if (strlen(out) > 1) {
+        shuffle_chars(out);
+        if (strcmp(out, word) == 0) {
+            shuffle_chars(out);
+        }
+    }
+}
+
+static void distort_remove(const char *word, char *out, size_t out_size) {
+    size_t len = strlen(word);
+    size_t pos = 0;
+    if (len <= 2) {
+        strncpy(out, word, out_size - 1);
+        out[out_size - 1] = '\0';
+        return;
+    }
+    for (size_t i = 0; i < len && pos + 1 < out_size; ++i) {
+        if ((rand() % 100) < 35 && i != 0 && i != len - 1) {
+            continue;
+        }
+        out[pos++] = word[i];
+    }
+    out[pos] = '\0';
+    if (strlen(out) < 2) {
+        snprintf(out, out_size, "%c_%c", word[0], word[len - 1]);
+    }
+}
+
+static void distort_reverse(const char *word, char *out, size_t out_size) {
+    size_t len = strlen(word);
+    if (len + 1 > out_size) len = out_size - 1;
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = word[len - 1 - i];
+    }
+    out[len] = '\0';
+}
+
+static const char *apply_random_distortion(const char *word, char *out, size_t out_size) {
+    int mode = rand() % 3;
+    if (mode == 0) {
+        distort_scramble(word, out, out_size);
+        return "SCRAMBLE";
+    }
+    if (mode == 1) {
+        distort_remove(word, out, out_size);
+        return "REMOVE";
+    }
+    distort_reverse(word, out, out_size);
+    return "REVERSE";
+}
+
+static bool words_match(const char *a, const char *b) {
+    char x[MAX_WORD], y[MAX_WORD];
+    to_lower_copy(x, a, sizeof(x));
+    to_lower_copy(y, b, sizeof(y));
+    return strcmp(x, y) == 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "Usage: %s <port> [rounds] [time_limit_seconds]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    int port_no = atoi(argv[1]);
+    int total_rounds = (argc >= 3) ? atoi(argv[2]) : DEFAULT_ROUNDS;
+    int time_limit = (argc >= 4) ? atoi(argv[3]) : DEFAULT_TIME_LIMIT;
+
+    if (port_no < 2000 || port_no > 65535 || total_rounds <= 0 || time_limit <= 0) {
+        fprintf(stderr, "Invalid arguments. Port: 2000-65535, rounds > 0, time_limit > 0\n");
+        return EXIT_FAILURE;
+    }
+
+    srand((unsigned int)time(NULL));
+
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) die_with_error("socket");
+
+    int opt = 1;
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        die_with_error("setsockopt");
+    }
+
+    struct sockaddr_in server_addr;
+    bzero((char *)&server_addr, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons((uint16_t)port_no);
+
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        die_with_error("bind");
+    }
+
+    if (listen(server_sock, 5) < 0) {
+        die_with_error("listen");
+    }
+
+    printf("Mixed Signals server listening on port %d...\n", port_no);
+    printf("Waiting for Player 1...\n");
+
+    struct sockaddr_in client_addr;
+    socklen_t client_size = sizeof(client_addr);
+    int p1 = accept(server_sock, (struct sockaddr *)&client_addr, &client_size);
+    if (p1 < 0) die_with_error("accept player1");
+    send_all(p1, "WELCOME You are Player 1. Waiting for Player 2...\n");
+
+    printf("Waiting for Player 2...\n");
+    int p2 = accept(server_sock, (struct sockaddr *)&client_addr, &client_size);
+    if (p2 < 0) die_with_error("accept player2");
+    send_all(p2, "WELCOME You are Player 2. Game is starting...\n");
+    send_all(p1, "Player 2 connected. Game is starting...\n");
+
+    int score1 = 0, score2 = 0;
+
+    for (int round = 1; round <= total_rounds; ++round) {
+        int sender = (round % 2 == 1) ? 1 : 2;
+        int guesser = (sender == 1) ? 2 : 1;
+        int sender_sock = (sender == 1) ? p1 : p2;
+        int guesser_sock = (guesser == 1) ? p1 : p2;
+
+        char message[BUFFER_SIZE];
+        snprintf(message, sizeof(message), "\n=== ROUND %d/%d ===\n", round, total_rounds);
+        send_all(p1, message);
+        send_all(p2, message);
+
+        snprintf(message, sizeof(message), "This round: Player %d sends the word. Player %d guesses.\n", sender, guesser);
+        send_all(p1, message);
+        send_all(p2, message);
+
+        char original[MAX_WORD];
+        while (1) {
+            int got = prompt_with_timeout(sender_sock,
+                "Enter one word (letters only, no spaces): ",
+                original, sizeof(original), 600);
+            if (got <= 0) {
+                send_all(p1, "A player disconnected or timed out while entering a word. Game ended.\n");
+                send_all(p2, "A player disconnected or timed out while entering a word. Game ended.\n");
+                close(p1); close(p2); close(server_sock);
+                return EXIT_SUCCESS;
+            }
+
+            bool valid = strlen(original) >= 2;
+            for (size_t i = 0; i < strlen(original); ++i) {
+                if (!isalpha((unsigned char)original[i])) {
+                    valid = false;
+                    break;
+                }
+            }
+            if (valid) break;
+            send_all(sender_sock, "Invalid input. Use one word with letters only.\n");
+        }
+
+        send_all(sender_sock, "Word accepted. Waiting for the guesser...\n");
+
+        char distorted1[MAX_WORD], distorted2[MAX_WORD];
+        const char *mode1 = apply_random_distortion(original, distorted1, sizeof(distorted1));
+        const char *mode2 = apply_random_distortion(original, distorted2, sizeof(distorted2));
+
+        int current_points = 10;
+        bool used_pass = false;
+        time_t start_time = time(NULL);
+
+        snprintf(message, sizeof(message),
+                 "Distorted word: %s\nMode: %s\nYou have %d seconds. Type your guess or PASS: ",
+                 distorted1, mode1, time_limit);
+        int result = prompt_with_timeout(guesser_sock, message, message, sizeof(message), time_limit);
+
+        if (result == -1) {
+            send_all(p1, "A player disconnected. Game ended.\n");
+            send_all(p2, "A player disconnected. Game ended.\n");
+            break;
+        }
+
+        if (result == 0) {
+            if (sender == 1) score1 += 10; else score2 += 10;
+            snprintf(message, sizeof(message),
+                     "Time is up. Player %d earns 10 points. The original word was '%s'.\n",
+                     sender, original);
+            send_all(p1, message);
+            send_all(p2, message);
+        } else {
+            trim_newline(message);
+            if (strcasecmp(message, "PASS") == 0) {
+                used_pass = true;
+                current_points = 5;
+                snprintf(message, sizeof(message),
+                         "You used your pass. New distorted word: %s\nMode: %s\nYou have %d seconds. Enter your final guess: ",
+                         distorted2, mode2, time_limit);
+                char final_guess[MAX_WORD];
+                int pass_result = prompt_with_timeout(guesser_sock, message, final_guess, sizeof(final_guess), time_limit);
+                if (pass_result == -1) {
+                    send_all(p1, "A player disconnected. Game ended.\n");
+                    send_all(p2, "A player disconnected. Game ended.\n");
+                    break;
+                }
+                if (pass_result == 0) {
+                    if (sender == 1) score1 += 10; else score2 += 10;
+                    snprintf(message, sizeof(message),
+                             "Time is up after PASS. Player %d earns 10 points. The original word was '%s'.\n",
+                             sender, original);
+                    send_all(p1, message);
+                    send_all(p2, message);
+                } else if (words_match(final_guess, original)) {
+                    int elapsed = (int)(time(NULL) - start_time);
+                    int bonus = (elapsed <= 5) ? 2 : 0;
+                    int earned = current_points + bonus;
+                    if (guesser == 1) score1 += earned; else score2 += earned;
+                    snprintf(message, sizeof(message),
+                             "Correct! Player %d earns %d points%s. The original word was '%s'.\n",
+                             guesser, earned, bonus ? " (includes 2-point speed bonus)" : "", original);
+                    send_all(p1, message);
+                    send_all(p2, message);
+                } else {
+                    if (sender == 1) score1 += 10; else score2 += 10;
+                    snprintf(message, sizeof(message),
+                             "Wrong guess. Player %d earns 10 points. The original word was '%s'.\n",
+                             sender, original);
+                    send_all(p1, message);
+                    send_all(p2, message);
+                }
+            } else if (words_match(message, original)) {
+                int elapsed = (int)(time(NULL) - start_time);
+                int bonus = (elapsed <= 5) ? 2 : 0;
+                int earned = current_points + bonus;
+                if (guesser == 1) score1 += earned; else score2 += earned;
+                snprintf(message, sizeof(message),
+                         "Correct! Player %d earns %d points%s. The original word was '%s'.\n",
+                         guesser, earned, bonus ? " (includes 2-point speed bonus)" : "", original);
+                send_all(p1, message);
+                send_all(p2, message);
+            } else {
+                if (sender == 1) score1 += 10; else score2 += 10;
+                snprintf(message, sizeof(message),
+                         "Wrong guess. Player %d earns 10 points. The original word was '%s'.\n",
+                         sender, original);
+                send_all(p1, message);
+                send_all(p2, message);
+            }
+        }
+
+        snprintf(message, sizeof(message), "Scoreboard -> Player 1: %d | Player 2: %d\n", score1, score2);
+        send_all(p1, message);
+        send_all(p2, message);
+    }
+
+    char final_msg[BUFFER_SIZE];
+    if (score1 > score2) {
+        snprintf(final_msg, sizeof(final_msg), "\nGAME OVER\nWinner: Player 1\nFinal Score -> P1: %d | P2: %d\n", score1, score2);
+    } else if (score2 > score1) {
+        snprintf(final_msg, sizeof(final_msg), "\nGAME OVER\nWinner: Player 2\nFinal Score -> P1: %d | P2: %d\n", score1, score2);
+    } else {
+        snprintf(final_msg, sizeof(final_msg), "\nGAME OVER\nIt's a tie!\nFinal Score -> P1: %d | P2: %d\n", score1, score2);
+    }
+
+    send_all(p1, final_msg);
+    send_all(p2, final_msg);
+
+    close(p1);
+    close(p2);
+    close(server_sock);
+    return EXIT_SUCCESS;
+}
