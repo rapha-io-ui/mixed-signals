@@ -69,3 +69,33 @@ NOTES:
 - Input word must be one word using letters only.
 - This is a TCP socket-based implementation inspired by the client-server reference.
 - Best tested on Linux or WSL.
+
+Use one PC as the server PC, and the other PC as a client PC.
+
+On PC 1: Server
+Run:
+
+cd "/mnt/c/Users/DC Gaming/Desktop/OS_GAME"
+./server 5000
+Then find PC 1’s IP address.
+
+On Windows PowerShell:
+
+ipconfig
+Look for something like:
+
+IPv4 Address . . . . . . . . . . : 192.168.1.25
+That 192.168.x.x number is the server IP.
+
+On PC 1: Player 1 Client
+Open another terminal on PC 1:
+
+cd "/mnt/c/Users/DC Gaming/Desktop/OS_GAME"
+./client localhost 5000
+On PC 2: Player 2 Client
+Copy/compile the client program on PC 2, then run:
+
+./client 192.168.1.25 5000
+Replace 192.168.1.25 with PC 1’s real IPv4 address.
+
+Both PCs must be on the same Wi-Fi/LAN. If PC 2 cannot connect, allow port 5000 through Windows Firewall on PC 1. Also make sure the server is already running before the clients connect.
