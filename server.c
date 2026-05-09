@@ -18,7 +18,11 @@
 #define MAX_NAME 32
 #define BUFFER_SIZE 512
 #define DEFAULT_ROUNDS 5
+#define DEFAULT_TIME_LIMIT 12
 #define REGULAR_SCORE 10
+#define PASS_SCORE 5
+#define SPEED_BONUS 2
+#define SPEED_BONUS_SECONDS 5
 #define SCORE_SCALE 4
 
 static void die_with_error(const char *msg) {
@@ -174,6 +178,90 @@ static int prompt_expected(int expected_sock, int other_sock, const char *expect
     }
 }
 
+static int prompt_expected_timed(int expected_sock, int other_sock, const char *expected_name,
+                                 const char *other_name, const char *prompt,
+                                 int time_limit_seconds, char *out, size_t out_size,
+                                 int *elapsed_seconds) {
+    if (send_all(expected_sock, prompt) < 0) return -1;
+
+    char expected_pending[BUFFER_SIZE] = "";
+    char other_pending[BUFFER_SIZE] = "";
+    size_t expected_pending_len = 0;
+    size_t other_pending_len = 0;
+
+    time_t start = time(NULL);
+    time_t deadline = start + time_limit_seconds;
+
+    while (1) {
+        time_t now = time(NULL);
+        if (now >= deadline) {
+            if (elapsed_seconds != NULL) *elapsed_seconds = time_limit_seconds;
+            return 0;
+        }
+
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(expected_sock, &readfds);
+        FD_SET(other_sock, &readfds);
+
+        struct timeval tv;
+        tv.tv_sec = deadline - now;
+        tv.tv_usec = 0;
+
+        int ready = select(max_int(expected_sock, other_sock) + 1, &readfds, NULL, NULL, &tv);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ready == 0) {
+            if (elapsed_seconds != NULL) *elapsed_seconds = time_limit_seconds;
+            return 0;
+        }
+
+        if (FD_ISSET(other_sock, &readfds)) {
+            if (drain_out_of_turn_input(other_sock, other_name, other_pending, &other_pending_len) < 0) return -1;
+        }
+
+        if (FD_ISSET(expected_sock, &readfds)) {
+            int n = recv_line_available(expected_sock, expected_pending, &expected_pending_len, out, out_size);
+            if (n < 0) return -1;
+            if (n == 1) {
+                clean_text(out);
+                if (elapsed_seconds != NULL) {
+                    int elapsed = (int)(time(NULL) - start);
+                    if (elapsed < 0) elapsed = 0;
+                    if (elapsed > time_limit_seconds) elapsed = time_limit_seconds;
+                    *elapsed_seconds = elapsed;
+                }
+                (void)expected_name;
+                return 1;
+            }
+        }
+    }
+}
+
+static void add_score(int player, int units, int *score1, int *score2) {
+    if (player == 1) *score1 += units;
+    else *score2 += units;
+}
+
+static void announce_correct(int p1, int p2, const char *guesser_name, int earned,
+                             int elapsed, const char *original, bool speed_bonus) {
+    char earned_text[32];
+    char msg[BUFFER_SIZE];
+    format_score(earned_text, sizeof(earned_text), earned);
+    if (speed_bonus) {
+        snprintf(msg, sizeof(msg),
+                 "Correct in %d second(s)! %s earns %s points, including a +%d speed bonus. Original word: '%s'.\n",
+                 elapsed, guesser_name, earned_text, SPEED_BONUS, original);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "Correct in %d second(s)! %s earns %s points. Original word: '%s'.\n",
+                 elapsed, guesser_name, earned_text, original);
+    }
+    send_both(p1, p2, msg);
+}
+
 static int live_countdown(int p1, int p2, int seconds, const char *label) {
     char msg[BUFFER_SIZE];
     char p1_pending[BUFFER_SIZE] = "";
@@ -283,7 +371,7 @@ static bool valid_word(const char *s) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2 || argc > 3) {
+    if (argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         return EXIT_FAILURE;
     }
@@ -292,9 +380,6 @@ int main(int argc, char *argv[]) {
     if (port_no < 2000 || port_no > 65535) {
         fprintf(stderr, "Invalid port. Use a port from 2000 to 65535.\n");
         return EXIT_FAILURE;
-    }
-    if (argc == 3) {
-        printf("Note: turn timers are disabled, so the extra time-limit argument is ignored.\n");
     }
 
     srand((unsigned int)time(NULL));
@@ -336,7 +421,8 @@ int main(int argc, char *argv[]) {
     char name2[MAX_NAME] = "Player 2";
     char tmp[BUFFER_SIZE];
 
-    send_both(p1, p2, "\nSETUP STEP 1/3: Player 1 must enter a name.\n");
+    /* STEP 1: Player 1 name */
+    send_both(p1, p2, "\nSETUP STEP 1/4: Player 1 must enter a name.\n");
     while (1) {
         if (prompt_expected(p1, p2, "Player 1", "Player 2",
                             "Player 1 name: ", name1, sizeof(name1)) < 0) goto disconnected;
@@ -344,17 +430,8 @@ int main(int argc, char *argv[]) {
         send_all(p1, "Name cannot be empty.\n");
     }
 
-    send_both(p1, p2, "\nSETUP STEP 2/3: Player 1 must choose how many rounds to play.\n");
-    int total_rounds = DEFAULT_ROUNDS;
-    while (1) {
-        snprintf(tmp, sizeof(tmp), "Number of rounds (1-50): ");
-        if (prompt_expected(p1, p2, name1, "Player 2", tmp, tmp, sizeof(tmp)) < 0) goto disconnected;
-        total_rounds = atoi(tmp);
-        if (total_rounds >= 1 && total_rounds <= 50) break;
-        send_all(p1, "Invalid round count. Enter a number from 1 to 50.\n");
-    }
-
-    send_both(p1, p2, "\nSETUP STEP 3/3: Player 2 must enter a name.\n");
+    /* STEP 2: Player 2 name */
+    send_both(p1, p2, "\nSETUP STEP 2/4: Player 2 must enter a name.\n");
     while (1) {
         if (prompt_expected(p2, p1, "Player 2", name1,
                             "Player 2 name: ", name2, sizeof(name2)) < 0) goto disconnected;
@@ -362,8 +439,59 @@ int main(int argc, char *argv[]) {
         send_all(p2, "Name cannot be empty.\n");
     }
 
-    snprintf(tmp, sizeof(tmp), "Game setup complete: %s vs %s | Rounds: %d\n",
-             name1, name2, total_rounds);
+    /* STEP 3: Player 1 chooses number of rounds */
+    int total_rounds = DEFAULT_ROUNDS;
+    send_both(p1, p2, "\nSETUP STEP 3/4: Player 1 must choose how many rounds to play.\n");
+    while (1) {
+        char rounds_input[BUFFER_SIZE];
+        if (prompt_expected(p1, p2, name1, name2,
+                            "How many rounds do you want to play? Enter 1-50: ",
+                            rounds_input, sizeof(rounds_input)) < 0) goto disconnected;
+
+        char *endptr = NULL;
+        long selected_rounds = strtol(rounds_input, &endptr, 10);
+        while (endptr != NULL && *endptr != '\0' && isspace((unsigned char)*endptr)) endptr++;
+
+        if (rounds_input[0] != '\0' && endptr != NULL && *endptr == '\0' &&
+            selected_rounds >= 1 && selected_rounds <= 50) {
+            total_rounds = (int)selected_rounds;
+            char confirm[BUFFER_SIZE];
+            snprintf(confirm, sizeof(confirm), "Rounds set to %d.\n", total_rounds);
+            send_both(p1, p2, confirm);
+            break;
+        }
+
+        send_all(p1, "Invalid input. Please enter a number from 1 to 50.\n");
+    }
+
+    /* STEP 4: Player 1 chooses time limit */
+    int time_limit = DEFAULT_TIME_LIMIT;
+    send_both(p1, p2, "\nSETUP STEP 4/4: Player 1 must choose the guess time limit.\n");
+    while (1) {
+        char time_input[BUFFER_SIZE];
+        if (prompt_expected(p1, p2, name1, name2,
+                            "How many seconds per guess? Enter 5-60: ",
+                            time_input, sizeof(time_input)) < 0) goto disconnected;
+
+        char *endptr = NULL;
+        long selected_time = strtol(time_input, &endptr, 10);
+        while (endptr != NULL && *endptr != '\0' && isspace((unsigned char)*endptr)) endptr++;
+
+        if (time_input[0] != '\0' && endptr != NULL && *endptr == '\0' &&
+            selected_time >= 5 && selected_time <= 60) {
+            time_limit = (int)selected_time;
+            char confirm[BUFFER_SIZE];
+            snprintf(confirm, sizeof(confirm), "Time limit set to %d seconds.\n", time_limit);
+            send_both(p1, p2, confirm);
+            break;
+        }
+
+        send_all(p1, "Invalid input. Please enter a number from 5 to 60.\n");
+    }
+
+    snprintf(tmp, sizeof(tmp),
+             "\nGame setup complete: %s vs %s | Rounds: %d | Guess timer: %d seconds | Speed bonus: +%d within %d seconds\n",
+             name1, name2, total_rounds, time_limit, SPEED_BONUS, SPEED_BONUS_SECONDS);
     send_both(p1, p2, tmp);
 
     if (live_countdown(p1, p2, 3, "Game starts in") < 0) goto disconnected;
@@ -401,44 +529,57 @@ int main(int argc, char *argv[]) {
         const char *mode2 = apply_random_distortion(original, distorted2, sizeof(distorted2));
 
         char guess[MAX_WORD];
-        snprintf(tmp, sizeof(tmp), "Distorted word: %s\nMode: %s\n%s, type your guess or PASS: ",
-                 distorted1, mode1, guesser_name);
-        if (prompt_expected(guesser_sock, sender_sock, guesser_name, sender_name,
-                            tmp, guess, sizeof(guess)) < 0) goto disconnected;
+        int elapsed = 0;
+        int first_result;
+        snprintf(tmp, sizeof(tmp),
+                 "Distorted word: %s\nMode: %s\n%s, type your guess or PASS. You have %d seconds: ",
+                 distorted1, mode1, guesser_name, time_limit);
+        first_result = prompt_expected_timed(guesser_sock, sender_sock, guesser_name, sender_name,
+                                             tmp, time_limit, guess, sizeof(guess), &elapsed);
+        if (first_result < 0) goto disconnected;
 
-        if (strcasecmp(guess, "PASS") == 0) {
-            snprintf(tmp, sizeof(tmp), "%s used PASS. New distorted word: %s\nMode: %s\n%s, enter your final guess: ",
-                     guesser_name, distorted2, mode2, guesser_name);
-            if (prompt_expected(guesser_sock, sender_sock, guesser_name, sender_name,
-                                tmp, guess, sizeof(guess)) < 0) goto disconnected;
-            if (words_match(guess, original)) {
-                int earned = (REGULAR_SCORE / 2) * SCORE_SCALE;
-                if (guesser == 1) score1 += earned;
-                else score2 += earned;
-                char earned_text[32];
-                format_score(earned_text, sizeof(earned_text), earned);
-                snprintf(tmp, sizeof(tmp), "Correct! %s earns %s points. Original word: '%s'.\n",
-                         guesser_name, earned_text, original);
+        if (first_result == 0) {
+            int earned = REGULAR_SCORE * SCORE_SCALE;
+            add_score(sender, earned, &score1, &score2);
+            snprintf(tmp, sizeof(tmp), "TIME'S OVER! %s earns %d points. Original word: '%s'.\n",
+                     sender_name, REGULAR_SCORE, original);
+            send_both(p1, p2, tmp);
+        } else if (strcasecmp(guess, "PASS") == 0) {
+            int final_elapsed = 0;
+            snprintf(tmp, sizeof(tmp),
+                     "%s used PASS. New distorted word: %s\nMode: %s\n%s, enter your final guess. You have %d seconds: ",
+                     guesser_name, distorted2, mode2, guesser_name, time_limit);
+            int pass_result = prompt_expected_timed(guesser_sock, sender_sock, guesser_name, sender_name,
+                                                    tmp, time_limit, guess, sizeof(guess), &final_elapsed);
+            if (pass_result < 0) goto disconnected;
+            if (pass_result == 0) {
+                int earned = REGULAR_SCORE * SCORE_SCALE;
+                add_score(sender, earned, &score1, &score2);
+                snprintf(tmp, sizeof(tmp), "TIME'S OVER after PASS! %s earns %d points. Original word: '%s'.\n",
+                         sender_name, REGULAR_SCORE, original);
                 send_both(p1, p2, tmp);
+            } else if (words_match(guess, original)) {
+                bool speed_bonus = final_elapsed <= SPEED_BONUS_SECONDS;
+                int earned = PASS_SCORE * SCORE_SCALE;
+                if (speed_bonus) earned += SPEED_BONUS * SCORE_SCALE;
+                add_score(guesser, earned, &score1, &score2);
+                announce_correct(p1, p2, guesser_name, earned, final_elapsed, original, speed_bonus);
             } else {
-                if (sender == 1) score1 += REGULAR_SCORE * SCORE_SCALE;
-                else score2 += REGULAR_SCORE * SCORE_SCALE;
+                int earned = REGULAR_SCORE * SCORE_SCALE;
+                add_score(sender, earned, &score1, &score2);
                 snprintf(tmp, sizeof(tmp), "Wrong guess. %s earns %d points. Original word: '%s'.\n",
                          sender_name, REGULAR_SCORE, original);
                 send_both(p1, p2, tmp);
             }
         } else if (words_match(guess, original)) {
+            bool speed_bonus = elapsed <= SPEED_BONUS_SECONDS;
             int earned = REGULAR_SCORE * SCORE_SCALE;
-            if (guesser == 1) score1 += earned;
-            else score2 += earned;
-            char earned_text[32];
-            format_score(earned_text, sizeof(earned_text), earned);
-            snprintf(tmp, sizeof(tmp), "Correct! %s earns %s points. Original word: '%s'.\n",
-                     guesser_name, earned_text, original);
-            send_both(p1, p2, tmp);
+            if (speed_bonus) earned += SPEED_BONUS * SCORE_SCALE;
+            add_score(guesser, earned, &score1, &score2);
+            announce_correct(p1, p2, guesser_name, earned, elapsed, original, speed_bonus);
         } else {
-            if (sender == 1) score1 += REGULAR_SCORE * SCORE_SCALE;
-            else score2 += REGULAR_SCORE * SCORE_SCALE;
+            int earned = REGULAR_SCORE * SCORE_SCALE;
+            add_score(sender, earned, &score1, &score2);
             snprintf(tmp, sizeof(tmp), "Wrong guess. %s earns %d points. Original word: '%s'.\n",
                      sender_name, REGULAR_SCORE, original);
             send_both(p1, p2, tmp);
